@@ -30,6 +30,11 @@ Python 标准库的其他模块。解密时必须按信封中的 key_id 定位�
 用途与退役状态。
 """
 
+import copy
+import hashlib
+import hmac
+from datetime import datetime, timedelta
+
 
 def add_key(ring, key_id, material, created_at) -> dict:
     """加入新密钥并设为当前。
@@ -43,7 +48,21 @@ def add_key(ring, key_id, material, created_at) -> dict:
 
     返回新加入的密钥条目 dict（即 ring["keys"][key_id]）。
     """
-    raise NotImplementedError
+    if created_at is None or not isinstance(created_at, datetime):
+        raise ValueError("created_at 必须是 datetime 且不能为 None")
+    version = ring["next_version"]
+    entry = {
+        "key_id": key_id,
+        "version": version,
+        "material": material,
+        "purpose": ring["purpose"],
+        "created_at": created_at,
+        "retired_at": None,
+    }
+    ring["keys"][key_id] = entry
+    ring["current"] = key_id
+    ring["next_version"] = version + 1
+    return entry
 
 
 def select_key(ring, purpose, now) -> dict:
@@ -58,7 +77,45 @@ def select_key(ring, purpose, now) -> dict:
 
     返回密钥条目 dict（环内对象，调用方不得修改）。
     """
-    raise NotImplementedError
+    if purpose != ring["purpose"]:
+        raise ValueError("用途不匹配：%r != %r" % (purpose, ring["purpose"]))
+    candidates = [
+        entry
+        for entry in ring["keys"].values()
+        if entry["purpose"] == purpose
+        and entry["created_at"] is not None
+        and entry["created_at"] <= now
+        and entry["retired_at"] is None
+    ]
+    if not candidates:
+        raise ValueError("没有可用密钥")
+    return max(candidates, key=lambda entry: entry["version"])
+
+
+def _keystream(material, length):
+    """由密钥材料确定性地展开出 length 字节的密钥流。"""
+    stream = bytearray()
+    counter = 0
+    while len(stream) < length:
+        block = hmac.new(
+            material, b"stream" + counter.to_bytes(8, "big"), hashlib.sha256
+        ).digest()
+        stream.extend(block)
+        counter += 1
+    return bytes(stream[:length])
+
+
+def _tag(material, key_id, version, purpose, ciphertext):
+    """对信封字段计算确定性认证标签。"""
+    msg = b"|".join(
+        [
+            key_id.encode("utf-8"),
+            str(version).encode("ascii"),
+            purpose.encode("utf-8"),
+            ciphertext,
+        ]
+    )
+    return hmac.new(material, msg, hashlib.sha256).hexdigest()
 
 
 def encrypt(ring, plaintext, now) -> dict:
@@ -72,7 +129,22 @@ def encrypt(ring, plaintext, now) -> dict:
 
     plaintext 为 bytes，返回 dict。
     """
-    raise NotImplementedError
+    key = select_key(ring, ring["purpose"], now)
+    stream = _keystream(key["material"], len(plaintext))
+    ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
+    return {
+        "key_id": key["key_id"],
+        "version": key["version"],
+        "purpose": key["purpose"],
+        "ciphertext": ciphertext,
+        "tag": _tag(
+            key["material"],
+            key["key_id"],
+            key["version"],
+            key["purpose"],
+            ciphertext,
+        ),
+    }
 
 
 def decrypt(ring, envelope, now) -> bytes:
@@ -87,7 +159,24 @@ def decrypt(ring, envelope, now) -> bytes:
 
     返回 bytes。
     """
-    raise NotImplementedError
+    key_id = envelope["key_id"]
+    key = ring["keys"][key_id]
+    purpose = envelope.get("purpose")
+    if purpose != key["purpose"] or purpose != ring["purpose"]:
+        raise ValueError("用途不匹配，禁止跨用途复用密钥")
+    retired_at = key["retired_at"]
+    if retired_at is not None:
+        overlap_days = ring["policy"]["overlap_days"]
+        if now >= retired_at + timedelta(days=overlap_days):
+            raise ValueError("密钥已退役且重叠期已过")
+    expected = _tag(
+        key["material"], key_id, envelope["version"], purpose, envelope["ciphertext"]
+    )
+    if not hmac.compare_digest(expected, envelope["tag"]):
+        raise ValueError("tag 校验失败")
+    ciphertext = envelope["ciphertext"]
+    stream = _keystream(key["material"], len(ciphertext))
+    return bytes(a ^ b for a, b in zip(ciphertext, stream))
 
 
 def retire(ring, key_id, now) -> dict:
@@ -100,7 +189,9 @@ def retire(ring, key_id, now) -> dict:
 
     返回被退役的密钥条目 dict。
     """
-    raise NotImplementedError
+    entry = ring["keys"][key_id]
+    entry["retired_at"] = now
+    return entry
 
 
 def rotate(ring, material, now) -> dict:
@@ -114,7 +205,8 @@ def rotate(ring, material, now) -> dict:
 
     返回新密钥条目 dict。
     """
-    raise NotImplementedError
+    key_id = ring["purpose"] + "-v" + str(ring["next_version"])
+    return add_key(ring, key_id, material, now)
 
 
 def validate_ring(ring, policy) -> list[str]:
@@ -130,7 +222,21 @@ def validate_ring(ring, policy) -> list[str]:
 
     返回 list[str]，每个问题一个字符串，顺序不限。
     """
-    raise NotImplementedError
+    problems = []
+    versions = [entry.get("version") for entry in ring["keys"].values()]
+    seen = set()
+    duplicates = {v for v in versions if v in seen or seen.add(v)}
+    if duplicates:
+        problems.append("版本重复：版本号 %s 被多个密钥使用" % sorted(duplicates))
+    overlap_days = ring["policy"]["overlap_days"]
+    if overlap_days > policy["max_overlap_days"]:
+        problems.append(
+            "重叠期过长：%d 天超过上限 %d 天" % (overlap_days, policy["max_overlap_days"])
+        )
+    for key_id, entry in ring["keys"].items():
+        if entry.get("created_at") is None:
+            problems.append("缺失创建时间：密钥 %s 没有 created_at" % key_id)
+    return problems
 
 
 def rotation_batch(operations, policy) -> dict:
@@ -157,4 +263,25 @@ def rotation_batch(operations, policy) -> dict:
     add_key 操作使用 key_id 与 material；rotate 使用 material；retire 使
     用 key_id。
     """
-    raise NotImplementedError
+    results = []
+    problems = {}
+    for index, op in enumerate(operations):
+        ring = copy.deepcopy(op["ring"])
+        try:
+            if op["action"] == "add_key":
+                result = add_key(ring, op["key_id"], op["material"], op["now"])
+            elif op["action"] == "rotate":
+                result = rotate(ring, op["material"], op["now"])
+            elif op["action"] == "retire":
+                result = retire(ring, op["key_id"], op["now"])
+            else:
+                raise ValueError("未知操作：%r" % op["action"])
+        except Exception as exc:
+            results.append(None)
+            problems[index] = [str(exc)]
+            continue
+        results.append(result)
+        issues = validate_ring(ring, policy)
+        if issues:
+            problems[index] = issues
+    return {"results": results, "problems": problems}
